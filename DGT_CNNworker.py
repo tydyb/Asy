@@ -62,7 +62,7 @@ def worker(comm, whole_comm, args):
     ind = np.arange(local_a, local_a + seg, dtype=np.int)
     train_loader = torch.utils.data.DataLoader(
             torch.utils.data.Subset(global_dataset, ind),
-            batch_size=args.batch_size, shuffle=True, **kwargs)
+            batch_size=args.batch_size, shuffle=True)#, **kwargs)
 
     #sample a batch
     trainloader_iter = iter(train_loader)
