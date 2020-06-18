@@ -102,7 +102,7 @@ def worker(comm, whole_comm, args):
     #the number of accumulated received iterates
     acc_recv = 0
 
-    buf = np.empty(4 * out_deg * (net_size * 2 + 10))
+    buf = np.empty(10 * out_deg * (net_size * 2 + 10))
     MPI.Attach_buffer(buf)
 
     asyn = args.asyn
@@ -131,7 +131,7 @@ def worker(comm, whole_comm, args):
 
         info = MPI.Status()
         recv_deg = 0
-        while (acc_recv < iter_num * in_deg) and (recv_deg < 1 * in_deg):
+        while (acc_recv < iter_num * in_deg) and (recv_deg < 0.5 * in_deg):
             while comm.Iprobe(source=MPI.ANY_SOURCE, status=info):
                 recv_rank = info.source
                 buffer = np.empty(buf_size, dtype=send_buf.dtype)
