@@ -1,6 +1,6 @@
 from mpi4py import MPI
 import numpy as np
-from LENET import LeNet, Model
+from LENET import Model
 import torch
 from torchvision import datasets, transforms
 import torch.optim as optim
@@ -10,8 +10,8 @@ import time
 
 def worker_grad(model, device, data, target, optimizer):
     optimizer.zero_grad()
-    output = model(data)
-    loss = F.nll_loss(output, target)
+    output = model(data.to(device))
+    loss = F.nll_loss(output, target.to(device))
     loss.backward()
 
     return loss.item()
@@ -60,7 +60,7 @@ def worker(comm, whole_comm, args):
     ind = np.arange(local_a, local_a + seg, dtype=np.int)
     train_loader = torch.utils.data.DataLoader(
             torch.utils.data.Subset(global_dataset, ind),
-            batch_size=args.batch_size, shuffle=True,)
+            batch_size=args.batch_size, shuffle=True, **kwargs)
 
     #sample a batch
     trainloader_iter = iter(train_loader)
@@ -91,8 +91,8 @@ def worker(comm, whole_comm, args):
     local_y = grad.clone().detach()
     last_grad = torch.zeros_like(local_y, device=device, requires_grad=False)
 
-    iter_num = 500
-    lr = 1e-3
+    iter_num = args.iter_num
+    lr = args.lr
     decay = 1
 
     #time series
@@ -102,10 +102,10 @@ def worker(comm, whole_comm, args):
     #the number of accumulated received iterates
     acc_recv = 0
 
-    buf = np.empty(3 * out_deg * (net_size * 2 + 10))
+    buf = np.empty(4 * out_deg * (net_size * 2 + 10))
     MPI.Attach_buffer(buf)
 
-    sync = 0
+    asyn = args.asyn
     for i in range(iter_num):
         # local update
         local_x -= lr * local_y
@@ -113,30 +113,25 @@ def worker(comm, whole_comm, args):
         local_y /= (out_deg + 1)
 
         #send local x and y to out neighbors
-        send_buf = torch.stack((local_x, local_y), dim=0).numpy()
+        send_buf = torch.stack((local_x, local_y), dim=0).cpu().numpy()
         buf_size = send_buf.shape
-        if acc_recv < iter_num * in_deg:
-            for j, outp in enumerate(out_peers):
-                #print(i, rank, 'send to', outp)
-                comm.Bsend([send_buf, MPI.FLOAT], dest=outp)
-        else:
-            for j, outp in enumerate(out_peers):
-                #print(i, rank, 'send to', outp)
-                comm.Send([send_buf, MPI.FLOAT], dest=outp)
+        for j, outp in enumerate(out_peers):
+            #print(i, rank, 'send to', outp)
+            comm.Bsend([send_buf, MPI.FLOAT], dest=outp)
 
         #receive local x and y from in neighbors
         #clear receive buffer and flag
         recv_flag = np.zeros((size, ), dtype=int)
 
-        if sync == 1:
+        if ~ asyn:
             comm.Barrier()
 
-        buf_x = torch.zeros_like(local_x, device=device, requires_grad=False)
-        buf_y = torch.zeros_like(local_y, device=device, requires_grad=False)
+        buf_x = torch.zeros(local_x.size(), requires_grad=False)
+        buf_y = torch.zeros(local_y.size(), requires_grad=False)
 
         info = MPI.Status()
         recv_deg = 0
-        while (acc_recv < iter_num * in_deg) and (recv_deg < 0.5 * in_deg):
+        while (acc_recv < iter_num * in_deg) and (recv_deg < 1 * in_deg):
             while comm.Iprobe(source=MPI.ANY_SOURCE, status=info):
                 recv_rank = info.source
                 buffer = np.empty(buf_size, dtype=send_buf.dtype)
@@ -149,9 +144,12 @@ def worker(comm, whole_comm, args):
                 recv_deg += 1
                 acc_recv += 1
                 info = MPI.Status()
-                if recv_deg > 2 * in_deg:
+                if recv_deg > 2.5 * in_deg:
                     break
-
+        
+        buf_x = buf_x.to(device)
+        buf_y = buf_y.to(device)
+        
         #average consensus and update local x
         buf_x += local_x
         local_x = buf_x / (recv_deg + 1)
@@ -177,8 +175,9 @@ def worker(comm, whole_comm, args):
 
         t_seq[i] = time.time() - start_t
         loss_seq[i] = obj
-        if sync == 1:
+        if ~ asyn:
             #compute error
+            '''
             global_obj = np.zeros(1)
             cons_error = np.zeros(1)
             aver_x = np.zeros(list(local_x.size()), dtype=np.float32)
@@ -192,9 +191,9 @@ def worker(comm, whole_comm, args):
             local_error = local_x.numpy() - aver_x
             comm.Reduce(np.dot(local_error, local_error), cons_error, root=0)
             cons_error = np.sqrt(cons_error)
-
-            if rank == 0:
-                print('iter: ', i, 'time', t_seq[i], 'local obj', obj, 'consensus error', cons_error, 'global obj:', global_obj)
+            '''
+            #if rank == 0:
+            print('rank', rank, 'iter: ', i, 'time', t_seq[i], 'local obj', obj) #, 'consensus error', cons_error, 'global obj:', global_obj)
         else:
             #whole_comm.isend([t_seq[i], obj], dest=whole_comm.Get_size() - 1)
             print('rank', rank, 'iter: ', i, 'time', t_seq[i], 'local obj', obj)
@@ -211,7 +210,7 @@ def worker(comm, whole_comm, args):
             info = MPI.Status()
 
     whole_comm.send(np.stack((t_seq, loss_seq), axis=1).tolist(), dest=whole_comm.Get_size() - 1)
-    whole_comm.Send([local_x.numpy(), MPI.FLOAT], dest=whole_comm.Get_size() - 1)
+    whole_comm.Send([local_x.cpu().numpy(), MPI.FLOAT], dest=whole_comm.Get_size() - 1)
 
 def test(model, device, test_loader):
     model.eval()
@@ -261,9 +260,9 @@ def monitor(comm, args):
                 print('monitor receives model from', recv_rank)
                 comm.Recv([buffer, MPI.FLOAT], source=recv_rank)
                 aver_x += buffer
+                stop_num += 1
             else:
                 buffer = comm.recv(source=recv_rank)
-                stop_num += 1
                 stop_flag[recv_rank] = 1
                 loss_rec.extend(buffer)
             info = MPI.Status()
@@ -287,7 +286,7 @@ def monitor(comm, args):
         loss_seq.append(np.average(train_log[i:end, 1]))
         i += aver_len
     train_log = np.stack((np.array(time_seq), np.array(loss_seq)), axis=1)
-    np.save('ADSGT_train_log_MNIST.npy', train_log)
+    np.save(str(args.asyn) + 'DSGT_train_log_MNIST.npy', train_log)
 
     aver_x = torch.from_numpy(aver_x / (size - 1))
     assign_array_to_net(aver_x, Net)
@@ -337,6 +336,9 @@ if __name__ == '__main__':
 
     parser.add_argument('--save-model', action='store_true', default=False,
                         help='For Saving the current Model')
+    
+    parser.add_argument('--asyn', type=int, default=1, metavar='ASYN', help='asynchronous training or not')
+    parser.add_argument('--iter-num', type=int, default=4000, metavar='ITER', help='iteration num per worker')
     args = parser.parse_args()
 
     if rank < size - 1:
