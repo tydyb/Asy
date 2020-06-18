@@ -41,7 +41,9 @@ def worker(comm, whole_comm, args):
     #load data and model
     use_cuda = not args.no_cuda and torch.cuda.is_available()
     torch.manual_seed(args.seed)
-    device = torch.device("cuda" if use_cuda else "cpu")
+    gpu_ind = rank % torch.cuda.device_count()
+    print(rank, "gpu", gpu_ind)
+    device = torch.device("cuda:"+ str(gpu_ind) if use_cuda else "cpu")
     kwargs = {'num_workers': 1, 'pin_memory': True} if use_cuda else {}
 
     global_dataset = datasets.MNIST('./data', train=True, download=True,
