@@ -131,22 +131,22 @@ def worker(comm, whole_comm, args):
 
         info = MPI.Status()
         recv_deg = 0
-        while (acc_recv < iter_num * in_deg) and (recv_deg < 0.5 * in_deg):
-            while comm.Iprobe(source=MPI.ANY_SOURCE, status=info):
-                recv_rank = info.source
-                buffer = np.empty(buf_size, dtype=send_buf.dtype)
-                comm.Recv([buffer, MPI.FLOAT], source=recv_rank)
-                #print(i, rank, 'receive from',  recv_rank)
-                #buffer = torch.from_numpy(buffer)
-                buf_x += torch.from_numpy(buffer[0, :])
-                buf_y += torch.from_numpy(buffer[1, :])
-                recv_flag[recv_rank] += 1
-                recv_deg += 1
-                acc_recv += 1
-                info = MPI.Status()
-                if recv_deg > 2.5 * in_deg:
-                    break
-        
+        #while (acc_recv < iter_num * in_deg) and (recv_deg < 0.5 * in_deg):
+        while comm.Iprobe(source=MPI.ANY_SOURCE, status=info):
+            recv_rank = info.source
+            buffer = np.empty(buf_size, dtype=send_buf.dtype)
+            comm.Recv([buffer, MPI.FLOAT], source=recv_rank)
+            #print(i, rank, 'receive from',  recv_rank)
+            #buffer = torch.from_numpy(buffer)
+            buf_x += torch.from_numpy(buffer[0, :])
+            buf_y += torch.from_numpy(buffer[1, :])
+            recv_flag[recv_rank] += 1
+            recv_deg += 1
+            acc_recv += 1
+            info = MPI.Status()
+            if recv_deg > 2.5 * in_deg:
+                break
+    
         buf_x = buf_x.to(device)
         buf_y = buf_y.to(device)
         
