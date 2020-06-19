@@ -10,8 +10,8 @@ import time
 
 def worker_grad(model, device, data, target, optimizer):
     optimizer.zero_grad()
-    output = model(data.to(device))
-    loss = F.nll_loss(output, target.to(device))
+    output = model(data)#.to(device, non_blocking=True))
+    loss = F.nll_loss(output, target)#.to(device, non_blocking=True))
     loss.backward()
 
     return loss.item()
@@ -46,6 +46,7 @@ def worker(comm, whole_comm, args):
     device = torch.device("cuda:"+ str(gpu_ind) if use_cuda else "cpu")
     kwargs = {'num_workers': 1, 'pin_memory': True} if use_cuda else {}
 
+    #prepare training dataset
     global_dataset = datasets.MNIST('./data', train=True, download=True,
                            transform=transforms.Compose([
                                transforms.ToTensor(),
@@ -60,8 +61,20 @@ def worker(comm, whole_comm, args):
     else:
         local_a = rank * seg + rmd
     ind = np.arange(local_a, local_a + seg, dtype=np.int)
-    train_loader = torch.utils.data.DataLoader(
-            torch.utils.data.Subset(global_dataset, ind),
+    local_dataset = torch.utils.data.Subset(global_dataset, ind)
+   
+    #move training data to gpu
+    data_tensor = []
+    target_tensor=[]
+    for i in range(local_dataset.__len__()):
+        data, target = local_dataset.__getitem__(i)
+        data_tensor.append(data)
+        target_tensor.append(torch.tensor(target))
+    data_tensor = torch.stack(data_tensor).to(device)
+    target_tensor = torch.stack(target_tensor).to(device)
+    tensor_local_dataset = torch.utils.data.TensorDataset(data_tensor, target_tensor)
+    
+    train_loader = torch.utils.data.DataLoader(tensor_local_dataset, 
             batch_size=args.batch_size, shuffle=True)#, **kwargs)
 
     #sample a batch
