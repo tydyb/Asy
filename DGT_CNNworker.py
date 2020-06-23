@@ -32,9 +32,10 @@ def worker(comm, whole_comm, args):
 
     #assign out/in neighbors
     neighbors = 1
-    out_peers = [(rank + 1) % size, (rank + size - 1) % size]
-    print(out_peers)
-    in_peers = out_peers
+    out_peers = [(rank + 1 + i) % size for i in range(3)]
+    #[(rank + 1) % size, (rank + size - 1) % size]
+    in_peers = [(rank - 1 - i + size) % size for i in range(3)]
+    print(rank, out_peers, in_peers)
     in_deg = len(in_peers)
     out_deg = len(out_peers)
 
@@ -117,113 +118,132 @@ def worker(comm, whole_comm, args):
     #the number of accumulated received iterates
     acc_recv = 0
 
-    buf = np.empty(10 * out_deg * (net_size * 2 + 10))
+    buf = np.empty(10 * out_deg * (net_size * 2 + 10), dtype=np.float)
     MPI.Attach_buffer(buf)
 
+    #record if an neighbor has exited
+    stop_flags = np.zeros([size, ], dtype=int)
+    
+    echo_interval = 100
     asyn = args.asyn
+    send_req = []
+    recv_deg = out_deg
     for i in range(iter_num):
-        # local update
-        local_x -= lr * local_y
-        #optimizer.step()
-        local_y /= (out_deg + 1)
+        if not asyn:
+            comm.Barrier()
 
         #send local x and y to out neighbors
-        send_buf = torch.stack((local_x, local_y), dim=0).cpu().numpy()
-        buf_size = send_buf.shape
-        for j, outp in enumerate(out_peers):
-            #print(i, rank, 'send to', outp)
-            comm.Bsend([send_buf, MPI.FLOAT], dest=outp)
+        send_complete = MPI.Request.Testall(send_req)
+        if recv_deg > 0 and send_complete == True:
+            send_x = local_x - lr * local_y
+            send_y = local_y / (out_deg + 1)
+            send_num = np.minimum(recv_deg, out_deg)
+            for outp in out_peers:#np.random.choice(out_peers, size=send_num, replace=False):
+                send_buf = torch.stack((send_x, send_y), dim=0).cpu().numpy()
+                tag = 0
+                send_req.append(comm.Isend([send_buf, MPI.FLOAT], dest=outp, tag=tag))
 
         #receive local x and y from in neighbors
         #clear receive buffer and flag
         recv_flag = np.zeros((size, ), dtype=int)
 
-        if ~ asyn:
-            comm.Barrier()
-
         buf_x = torch.zeros(local_x.size(), requires_grad=False)
         buf_y = torch.zeros(local_y.size(), requires_grad=False)
 
-        info = MPI.Status()
         recv_deg = 0
-        #while (acc_recv < iter_num * in_deg) and (recv_deg < 0.5 * in_deg):
-        while comm.Iprobe(source=MPI.ANY_SOURCE, status=info):
-            recv_rank = info.source
-            buffer = np.empty(buf_size, dtype=send_buf.dtype)
-            comm.Recv([buffer, MPI.FLOAT], source=recv_rank)
-            #print(i, rank, 'receive from',  recv_rank)
-            #buffer = torch.from_numpy(buffer)
-            buf_x += torch.from_numpy(buffer[0, :])
-            buf_y += torch.from_numpy(buffer[1, :])
-            recv_flag[recv_rank] += 1
-            recv_deg += 1
-            acc_recv += 1
-            info = MPI.Status()
-            if recv_deg > 2.5 * in_deg:
-                break
-    
+        buf_size = [2, net_size]
+        if asyn:
+            waiting_time = 5
+            s_time = time.time()
+            while in_deg > 0 and recv_deg == 0:
+                info = MPI.Status()
+                while comm.Iprobe(source=MPI.ANY_SOURCE, status=info):
+                    recv_rank = info.source
+                    recv_tag = info.tag
+                    #print(i, rank, "receiving", recv_rank)
+                    recvbuf = np.zeros(buf_size, dtype=np.float32)
+                    comm.Recv([recvbuf, MPI.FLOAT], source=recv_rank)
+                    if recv_tag == 1:
+                        stop_flags[recv_rank] = 1
+                        if recv_rank in out_peers:
+                            out_peers.remove(recv_rank)
+                            out_deg -= 1
+                        if recv_rank in in_peers:
+                            in_peers.remove(recv_rank)
+                            in_deg -= 1
+                    else:
+                        buf_x += torch.from_numpy(recvbuf[0, :])
+                        buf_y += torch.from_numpy(recvbuf[1, :])
+                        recv_flag[recv_rank] += 1
+                        recv_deg += 1
+                        acc_recv += 1
+                    info = MPI.Status()
+                    if recv_deg > in_deg:
+                        break
+                if time.time() - s_time > wait_time:
+                    break
+            wait_times -= 1
+        else:
+            for j, inp in enumerate(in_peers):
+                recvbuf = np.zeros(buf_size, dtype=send_buf.dtype)
+                comm.Recv([recvbuf, MPI.FLOAT], source=inp)
+                buf_x += torch.from_numpy(recvbuf[0, :])
+                buf_y += torch.from_numpy(recvbuf[1, :])
+                recv_deg += 1    
+                recv_flag[recv_rank] += 1
         buf_x = buf_x.to(device)
         buf_y = buf_y.to(device)
-        
-        #average consensus and update local x
-        buf_x += local_x
-        local_x = buf_x / (recv_deg + 1)
-        buf_y += local_y
+       
+        if recv_deg > 0:
+            # local update
+            local_x -= lr * local_y
+            local_y /= (out_deg + 1)
+            
+            #average consensus and update local x
+            buf_x += local_x
+            local_x = buf_x / (recv_deg + 1)
+            buf_y += local_y
 
-        #update net parameters
-        assign_array_to_net(local_x, Net)
+            #update net parameters
+            assign_array_to_net(local_x, Net)
 
-        #compute gradient and update localy
-        last_grad.copy_(grad)
-        try:
-            batch, target = next(trainloader_iter)
-        except StopIteration:
-            trainloader_iter = iter(train_loader)
-            batch, target = next(trainloader_iter)
-        obj = worker_grad(Net, device, batch, target, optimizer)
-        grad = []
-        for param in Net.parameters():
-            grad.append(param.grad.view(-1).clone())
-        grad = torch.cat(grad).detach()
-        local_y = buf_y + grad - last_grad
-        lr *= decay
+            #compute gradient and update localy
+            last_grad.copy_(grad)
+            try:
+                batch, target = next(trainloader_iter)
+            except StopIteration:
+                trainloader_iter = iter(train_loader)
+                batch, target = next(trainloader_iter)
+            obj = worker_grad(Net, device, batch, target, optimizer)
+            grad = []
+            for param in Net.parameters():
+                grad.append(param.grad.view(-1).clone())
+            grad = torch.cat(grad).detach()
+            local_y = buf_y + grad - last_grad
+            lr *= decay
 
         t_seq[i] = time.time() - start_t
         loss_seq[i] = obj
-        if ~ asyn:
-            #compute error
-            '''
-            global_obj = np.zeros(1)
-            cons_error = np.zeros(1)
-            aver_x = np.zeros(list(local_x.size()), dtype=np.float32)
-
-            comm.Allreduce(local_x.numpy(), aver_x, op=MPI.SUM)
-            aver_x /= size
-
-            comm.Reduce(np.array(obj), global_obj, op=MPI.SUM, root=0)
-            global_obj /= size
-
-            local_error = local_x.numpy() - aver_x
-            comm.Reduce(np.dot(local_error, local_error), cons_error, root=0)
-            cons_error = np.sqrt(cons_error)
-            '''
-            #if rank == 0:
-            print('rank', rank, 'iter: ', i, 'time', t_seq[i], 'local obj', obj) #, 'consensus error', cons_error, 'global obj:', global_obj)
-        else:
-            #whole_comm.isend([t_seq[i], obj], dest=whole_comm.Get_size() - 1)
+        if i % echo_interval == 0:
             print('rank', rank, 'iter: ', i, 'time', t_seq[i], 'local obj', obj)
+        
+    send_list = list(range(size))
+    send_list.remove(rank)
+    for node in send_list:
+        sendbuf = np.zeros([1, ], )
+        comm.Send(sendbuf, dest=node, tag=1)
 
     #receive the left iterates from neighbors
+    '''
     info = MPI.Status()
     buffer = np.empty(buf_size, dtype=np.float32)
     while acc_recv < iter_num * in_deg:
         while comm.Iprobe(source=MPI.ANY_SOURCE, status=info):
             recv_rank = info.source
             comm.Recv([buffer, MPI.FLOAT], source=recv_rank)
-            print("after training, ", rank, "receive from", recv_rank)
             acc_recv += 1
             info = MPI.Status()
-
+    '''
     whole_comm.send(np.stack((t_seq, loss_seq), axis=1).tolist(), dest=whole_comm.Get_size() - 1)
     whole_comm.Send([local_x.cpu().numpy(), MPI.FLOAT], dest=whole_comm.Get_size() - 1)
 
@@ -301,7 +321,7 @@ def monitor(comm, args):
         loss_seq.append(np.average(train_log[i:end, 1]))
         i += aver_len
     train_log = np.stack((np.array(time_seq), np.array(loss_seq)), axis=1)
-    np.save(str(args.asyn) + 'DSGT_train_log_MNIST.npy', train_log)
+    np.save(str(int(args.asyn)) + 'DSGT_train_log_MNIST_n' + str(size - 1)  + '.npy', train_log)
 
     aver_x = torch.from_numpy(aver_x / (size - 1))
     assign_array_to_net(aver_x, Net)
@@ -352,7 +372,7 @@ if __name__ == '__main__':
     parser.add_argument('--save-model', action='store_true', default=False,
                         help='For Saving the current Model')
     
-    parser.add_argument('--asyn', type=int, default=1, metavar='ASYN', help='asynchronous training or not')
+    parser.add_argument('--asyn', type=bool, default=True, metavar='ASYN', help='asynchronous training or not')
     parser.add_argument('--iter-num', type=int, default=4000, metavar='ITER', help='iteration num per worker')
     args = parser.parse_args()
 
